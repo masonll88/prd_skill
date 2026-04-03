@@ -1,4 +1,10 @@
-"""FastAPI entrypoint for the PRD skill service."""
+"""prd_skill 的 FastAPI 入口文件。
+
+中文说明：
+- 本文件只负责应用初始化、路由注册和异常映射
+- 不承载业务编排、持久化逻辑或 LLM 调用细节
+- 所有业务逻辑统一下沉到 service 层
+"""
 
 from __future__ import annotations
 
@@ -37,6 +43,8 @@ _service = PrdService(_session_store, _llm_provider)
 
 
 def _error_response(status_code: int, error: ErrorResponse) -> JSONResponse:
+    """中文说明：将标准错误模型包装为 JSONResponse。"""
+
     return JSONResponse(status_code=status_code, content=error.model_dump())
 
 
@@ -44,7 +52,7 @@ def _error_response(status_code: int, error: ErrorResponse) -> JSONResponse:
 async def handle_session_not_found(
     _request: Request, exc: SessionNotFoundError
 ) -> JSONResponse:
-    """Map missing session errors to HTTP 404."""
+    """中文说明：将会话不存在异常映射为 HTTP 404。"""
 
     return _error_response(
         404,
@@ -60,7 +68,7 @@ async def handle_session_not_found(
 async def handle_invalid_request_shape(
     _request: Request, exc: InvalidRequestShapeError
 ) -> JSONResponse:
-    """Map invalid request shape errors to HTTP 400."""
+    """中文说明：将请求 shape 非法异常映射为 HTTP 400。"""
 
     return _error_response(
         400,
@@ -76,7 +84,7 @@ async def handle_invalid_request_shape(
 async def handle_insufficient_facts(
     _request: Request, exc: InsufficientFactsError
 ) -> JSONResponse:
-    """Map insufficient fact errors to HTTP 400."""
+    """中文说明：将事实不足异常映射为 HTTP 400。"""
 
     return _error_response(
         400,
@@ -92,7 +100,7 @@ async def handle_insufficient_facts(
 async def handle_unsupported_mode(
     _request: Request, exc: UnsupportedModeError
 ) -> JSONResponse:
-    """Map unsupported mode errors to HTTP 400."""
+    """中文说明：将不支持模式异常映射为 HTTP 400。"""
 
     return _error_response(
         400,
@@ -108,7 +116,7 @@ async def handle_unsupported_mode(
 async def handle_validation_error(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Return the standard error model for request validation errors."""
+    """中文说明：将请求校验异常映射为统一错误响应。"""
 
     return _error_response(
         422,
@@ -122,7 +130,7 @@ async def handle_validation_error(
 
 @app.exception_handler(ServiceError)
 async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResponse:
-    """Fallback mapping for unhandled service errors."""
+    """中文说明：兜底处理未显式映射的服务层异常。"""
 
     return _error_response(
         500,
@@ -140,7 +148,7 @@ async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResp
     responses={500: {"model": ErrorResponse}},
 )
 async def health() -> HealthResponse:
-    """Return service health."""
+    """中文说明：返回服务健康状态。"""
 
     return HealthResponse(status="ok")
 
@@ -155,7 +163,7 @@ async def health() -> HealthResponse:
     },
 )
 async def start_session(request: SessionStartRequest) -> SessionStartResponse:
-    """Start a PRD session."""
+    """中文说明：启动新的 PRD 会话。"""
 
     return _service.start_session(request)
 
@@ -171,7 +179,7 @@ async def start_session(request: SessionStartRequest) -> SessionStartResponse:
     },
 )
 async def continue_session(request: SessionContinueRequest) -> SessionContinueResponse:
-    """Continue a PRD session."""
+    """中文说明：继续已有的 PRD 会话。"""
 
     return _service.continue_session(request)
 
@@ -187,7 +195,7 @@ async def continue_session(request: SessionContinueRequest) -> SessionContinueRe
     },
 )
 async def generate_prd(request: GeneratePrdRequest) -> PrdGenerateResponse:
-    """Generate PRD markdown from a session or one-shot payload."""
+    """中文说明：根据 session 或 one-shot 请求生成 PRD markdown。"""
 
     return _service.generate_prd(request)
 
@@ -202,6 +210,6 @@ async def generate_prd(request: GeneratePrdRequest) -> PrdGenerateResponse:
     },
 )
 async def generate_tasks(request: TasksGenerateRequest) -> TasksGenerateResponse:
-    """Generate implementation tasks from PRD markdown."""
+    """中文说明：根据 PRD markdown 生成实现任务。"""
 
     return _service.generate_tasks(request)
