@@ -73,3 +73,57 @@ def build_reverse_prd_prompt(input_text: str, project_context: Optional[str]) ->
         f"PROJECT_CONTEXT: {project_context or ''}",
     ]
     return "\n".join(lines)
+
+
+def build_task_generation_prompt(prd_summary: str) -> str:
+    """Build a compact prompt describing task decomposition intent."""
+
+    return "\n".join(
+        [
+            "TASK_MODE: decompose_prd",
+            "请基于以下 PRD 摘要拆解实现任务，按业务优先级排序。",
+            prd_summary,
+        ]
+    )
+
+
+def build_codex_execution_prompt(task_markdown: str) -> str:
+    """Build a Codex-oriented execution prompt from generated tasks."""
+
+    return "\n".join(
+        [
+            "请先阅读 AGENTS.md、PRD.md、TASKS.md、IMPLEMENT.md。",
+            "先输出计划，不要立即编码。",
+            "按 milestone 顺序实施，不要扩展范围。",
+            "每完成一个 milestone 后先运行验证，再继续下一个 milestone。",
+            "全部完成后输出 changed files / verification / known limitations。",
+            "",
+            task_markdown,
+        ]
+    )
+
+
+def build_implement_markdown(
+    project_name: str,
+    milestones: list[str],
+    project_context: Optional[str],
+) -> str:
+    """Build IMPLEMENT.md-style execution guidance."""
+
+    lines = [
+        "# IMPLEMENT",
+        f"## Project",
+        project_name,
+        "## Workflow",
+        "1. 先阅读 AGENTS.md、PRD.md、TASKS.md、IMPLEMENT.md。",
+        "2. 先输出实现计划，不要立即编码。",
+        "3. 按 milestone 顺序实施。",
+        "4. 每个 milestone 后运行验证。",
+        "5. 最后输出 changed files / verification / known limitations。",
+        "## Milestones",
+    ]
+    for index, milestone in enumerate(milestones, start=1):
+        lines.append(f"{index}. {milestone}")
+    if project_context:
+        lines.extend(["## Project Context", project_context])
+    return "\n".join(lines)

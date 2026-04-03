@@ -135,3 +135,32 @@ class PrdGenerateResponse(BaseModel):
     markdown: str
     missing_information: list[str]
     status: str
+
+
+class TaskItem(BaseModel):
+    """A single implementation task derived from a PRD."""
+
+    title: str
+    category: str
+    priority: str
+    milestone: str
+    objective: str
+    deliverable: str
+
+
+class TasksGenerateRequest(BaseModel):
+    """Request body for task generation from PRD markdown."""
+
+    prd_markdown: str = Field(min_length=1)
+    project_name: Optional[str] = None
+    mode: Optional[SessionMode] = None
+    project_context: Optional[str] = None
+
+
+class TasksGenerateResponse(BaseModel):
+    """Response containing decomposed tasks and execution prompts."""
+
+    tasks: list[TaskItem]
+    task_markdown: str
+    implement_markdown: str
+    codex_prompt: str

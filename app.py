@@ -11,6 +11,8 @@ from schemas import (
     ErrorResponse,
     GeneratePrdRequest,
     HealthResponse,
+    TasksGenerateRequest,
+    TasksGenerateResponse,
     SessionContinueRequest,
     SessionContinueResponse,
     SessionStartRequest,
@@ -188,3 +190,18 @@ async def generate_prd(request: GeneratePrdRequest) -> PrdGenerateResponse:
     """Generate PRD markdown from a session or one-shot payload."""
 
     return _service.generate_prd(request)
+
+
+@app.post(
+    "/tasks/generate",
+    response_model=TasksGenerateResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def generate_tasks(request: TasksGenerateRequest) -> TasksGenerateResponse:
+    """Generate implementation tasks from PRD markdown."""
+
+    return _service.generate_tasks(request)

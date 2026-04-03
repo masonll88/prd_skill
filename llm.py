@@ -19,6 +19,10 @@ def _split_items(value: str) -> list[str]:
     return [item.strip() for item in value.split("|") if item.strip()]
 
 
+def _contains_keyword(items: list[str], keyword: str) -> bool:
+    return any(keyword in item for item in items)
+
+
 class BaseLLMProvider(ABC):
     """Abstract interface for generating PRD markdown from prompts."""
 
@@ -88,35 +92,25 @@ class StubLLMProvider(BaseLLMProvider):
         """Render markdown in the exact PRD structure required by the project."""
 
         user_lines = "\n".join(f"- {item}" for item in users)
-        scenario_lines = "\n".join(f"- {item}" for item in scenarios)
-        function_lines = "\n".join(f"- {item}" for item in functions)
+        scenario_lines = "\n".join(
+            f"- {item}：围绕“{goal}”完成关键操作。" for item in scenarios
+        )
+        function_lines = "\n".join(
+            f"- {item}：支撑“{goal}”这一目标的核心业务能力。" for item in functions
+        )
         flow_lines = "\n".join(
             f"{index}. {item}" for index, item in enumerate(conversion_path, start=1)
         )
 
-        data_entities = [
-            "- 用户：用户ID、角色、状态",
-            "- 需求会话：session_id、mode、turn_count、更新时间",
-            "- PRD草稿：标题、章节内容、生成时间",
-        ]
-        if project_context:
-            data_entities.append("- 项目上下文：上下文摘要、来源说明")
+        data_entities = self._build_data_entities(functions)
         data_model_lines = "\n".join(data_entities)
-
-        tracking_lines = "\n".join(
-            [
-                "- 记录 session 创建数",
-                "- 记录 PRD 生成成功率",
-                "- 记录事实补全轮次",
-            ]
-        )
+        behavior_lines = self._build_behavior_lines(goal, scenarios, conversion_path)
+        tracking_lines = self._build_tracking_lines(conversion_path, functions)
+        background_lines = self._build_background_lines(goal, source_summary, project_context)
 
         return f"""# PRD
 ## 1. 背景与目标
-{source_summary}
-
-目标：
-- {goal}
+{background_lines}
 
 ## 2. 用户与场景
 用户：
@@ -135,9 +129,7 @@ class StubLLMProvider(BaseLLMProvider):
 {data_model_lines}
 
 ## 6. 行为定义
-- 系统支持围绕目标、用户、场景、核心功能和转化路径逐步完善需求。
-- 系统在信息不足时提示补充关键业务事实，在信息充分时输出结构化 PRD。
-- 系统根据当前模式生成对应的 PRD 草稿，便于继续迭代。
+{behavior_lines}
 
 ## 7. 转化路径
 {flow_lines}
@@ -145,3 +137,51 @@ class StubLLMProvider(BaseLLMProvider):
 ## 8. 数据埋点（可选）
 {tracking_lines}
 """
+
+    def _build_background_lines(
+        self, goal: str, source_summary: str, project_context: str
+    ) -> str:
+        """Build business-oriented background and goal content."""
+
+        lines = [source_summary, "", "目标：", f"- {goal}"]
+        if project_context:
+            lines.extend(["", f"上下文补充：{project_context}"])
+        return "\n".join(lines)
+
+    def _build_data_entities(self, functions: list[str]) -> list[str]:
+        """Build logical entities from business functions."""
+
+        entities = ["- 用户：用户ID、角色、状态"]
+        if _contains_keyword(functions, "商品"):
+            entities.append("- 商品：商品ID、商品名称、商品状态、所属分类")
+        if _contains_keyword(functions, "分类"):
+            entities.append("- 分类：分类ID、分类名称、排序状态")
+        if _contains_keyword(functions, "分享"):
+            entities.append("- 分享记录：分享ID、分享用户、分享渠道、转化结果")
+        if len(entities) == 1:
+            entities.append("- 业务对象：对象ID、对象名称、对象状态、关键属性")
+        return entities
+
+    def _build_behavior_lines(
+        self, goal: str, scenarios: list[str], conversion_path: list[str]
+    ) -> str:
+        """Build user-oriented business behavior lines."""
+
+        lines: list[str] = []
+        for scenario in scenarios:
+            lines.append(f"- 用户在“{scenario}”场景下，为了“{goal}”执行对应业务操作。")
+        for step in conversion_path:
+            lines.append(f"- 用户在“{step}”节点完成推进，并进入下一步转化阶段。")
+        return "\n".join(lines)
+
+    def _build_tracking_lines(
+        self, conversion_path: list[str], functions: list[str]
+    ) -> str:
+        """Build optional tracking suggestions from business flow."""
+
+        lines = [f"- 记录用户在“{step}”节点的转化情况" for step in conversion_path]
+        if _contains_keyword(functions, "分享"):
+            lines.append("- 记录分享行为的渠道分布与分享后转化结果")
+        if not lines:
+            lines.append("- 记录关键业务动作的完成情况")
+        return "\n".join(lines)

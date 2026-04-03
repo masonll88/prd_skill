@@ -8,9 +8,12 @@ from uuid import uuid4
 
 from llm import BaseLLMProvider
 from prompts import (
+    build_implement_markdown,
+    build_codex_execution_prompt,
     build_follow_up_prompt,
     build_interactive_prd_prompt,
     build_reverse_prd_prompt,
+    build_task_generation_prompt,
 )
 from schemas import (
     ExtractedFacts,
@@ -24,6 +27,9 @@ from schemas import (
     SessionStartRequest,
     SessionStartResponse,
     SessionState,
+    TaskItem,
+    TasksGenerateRequest,
+    TasksGenerateResponse,
 )
 from session_store import SessionStore
 
@@ -167,6 +173,29 @@ class PrdService:
             project_context=request.project_context,
         )
 
+    def generate_tasks(self, request: TasksGenerateRequest) -> TasksGenerateResponse:
+        """Generate implementation tasks from PRD markdown using rules."""
+
+        summary = self._summarize_prd(request.prd_markdown)
+        task_generation_prompt = build_task_generation_prompt(summary)
+        sections = self._extract_prd_sections(request.prd_markdown)
+        tasks = self._build_tasks_from_sections(sections)
+        project_name = request.project_name or "prd_skill"
+        milestones = self._collect_milestones(tasks)
+        task_markdown = self._build_tasks_markdown(tasks, task_generation_prompt, project_name)
+        implement_markdown = build_implement_markdown(
+            project_name=project_name,
+            milestones=milestones,
+            project_context=request.project_context,
+        )
+        codex_prompt = build_codex_execution_prompt(task_markdown + "\n\n" + implement_markdown)
+        return TasksGenerateResponse(
+            tasks=tasks,
+            task_markdown=task_markdown,
+            implement_markdown=implement_markdown,
+            codex_prompt=codex_prompt,
+        )
+
     def _generate_from_session(self, session: SessionState) -> PrdGenerateResponse:
         if session.mode == SessionMode.INTERACTIVE:
             missing_information = self._missing_interactive_facts(session.extracted_facts)
@@ -259,6 +288,164 @@ class PrdService:
             "next_prompt": next_prompt,
             "status": self._resolve_session_status(session.mode, can_generate, missing_information),
         }
+
+    def _summarize_prd(self, prd_markdown: str) -> str:
+        """Summarize relevant PRD sections for downstream task generation."""
+
+        lines = [line.strip() for line in prd_markdown.splitlines() if line.strip()]
+        selected_lines: list[str] = []
+        for line in lines:
+            if line.startswith("# PRD") or line.startswith("## "):
+                selected_lines.append(line)
+                continue
+            if len(selected_lines) >= 14:
+                break
+            selected_lines.append(line)
+        return "\n".join(selected_lines[:14])
+
+    def _build_tasks_markdown(
+        self, tasks: list[TaskItem], task_generation_prompt: str, project_name: str
+    ) -> str:
+        """Render generated tasks as markdown."""
+
+        lines = [
+            "# Tasks",
+            "## Project",
+            project_name,
+            "## Summary",
+            task_generation_prompt,
+            "## Task List",
+        ]
+        for index, task in enumerate(tasks, start=1):
+            lines.extend(
+                [
+                    f"### {index}. {task.title}",
+                    f"- Category: {task.category}",
+                    f"- Priority: {task.priority}",
+                    f"- Milestone: {task.milestone}",
+                    f"- Objective: {task.objective}",
+                    f"- Deliverable: {task.deliverable}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _extract_prd_sections(self, prd_markdown: str) -> dict[str, str]:
+        """Extract PRD sections into a structured mapping."""
+
+        sections: dict[str, list[str]] = {}
+        current_section = "root"
+        for raw_line in prd_markdown.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("## "):
+                current_section = line[3:].strip()
+                sections.setdefault(current_section, [])
+                continue
+            sections.setdefault(current_section, []).append(line)
+        return {key: "\n".join(value) for key, value in sections.items()}
+
+    def _build_tasks_from_sections(self, sections: dict[str, str]) -> list[TaskItem]:
+        """Build milestone-based tasks from PRD sections."""
+
+        tasks: list[TaskItem] = [
+            TaskItem(
+                title="梳理目标与范围边界",
+                category="planning",
+                priority="P0",
+                milestone="M1-Planning",
+                objective="基于背景与目标、用户与场景明确本次交付边界和成功标准。",
+                deliverable="形成可执行的范围说明、目标说明和关键场景清单。",
+            )
+        ]
+
+        if "3. 功能定义" in sections:
+            tasks.append(
+                TaskItem(
+                    title="拆解功能模块与接口边界",
+                    category="application",
+                    priority="P0",
+                    milestone="M2-Core Delivery",
+                    objective="将功能定义拆成可交付模块，并明确模块输入输出边界。",
+                    deliverable="完成功能模块划分和主接口交互约束。",
+                )
+            )
+        if "4. 用户流程" in sections:
+            tasks.append(
+                TaskItem(
+                    title="实现主流程编排",
+                    category="workflow",
+                    priority="P0",
+                    milestone="M2-Core Delivery",
+                    objective="根据用户流程实现关键业务路径和状态流转。",
+                    deliverable="交付符合 PRD 主流程的编排逻辑。",
+                )
+            )
+        if "5. 数据模型（逻辑）" in sections:
+            tasks.append(
+                TaskItem(
+                    title="落地逻辑数据模型",
+                    category="data",
+                    priority="P1",
+                    milestone="M2-Core Delivery",
+                    objective="根据逻辑数据模型定义核心实体和关键字段。",
+                    deliverable="完成实体、状态和关键字段结构设计。",
+                )
+            )
+        if "6. 行为定义" in sections:
+            tasks.append(
+                TaskItem(
+                    title="补齐业务行为约束",
+                    category="behavior",
+                    priority="P1",
+                    milestone="M3-Behavior and Quality",
+                    objective="将行为定义转成可执行的业务规则和边界处理。",
+                    deliverable="完成主要业务规则、异常路径和状态处理。",
+                )
+            )
+        if "7. 转化路径" in sections:
+            tasks.append(
+                TaskItem(
+                    title="接入转化路径支持",
+                    category="conversion",
+                    priority="P1",
+                    milestone="M3-Behavior and Quality",
+                    objective="围绕转化路径补齐关键节点、状态和输出结果。",
+                    deliverable="完成转化链路相关流程和输出定义。",
+                )
+            )
+        if "8. 数据埋点（可选）" in sections:
+            tasks.append(
+                TaskItem(
+                    title="补充埋点与验证清单",
+                    category="observability",
+                    priority="P2",
+                    milestone="M4-Verification",
+                    objective="根据埋点要求整理观测点和验证检查项。",
+                    deliverable="完成埋点事件清单和基础验证方案。",
+                )
+            )
+
+        tasks.append(
+            TaskItem(
+                title="整理交付与验证结果",
+                category="delivery",
+                priority="P0",
+                milestone="M4-Verification",
+                objective="在全部 milestone 完成后统一整理变更、验证和限制。",
+                deliverable="输出 changed files、verification、known limitations。",
+            )
+        )
+        return tasks
+
+    def _collect_milestones(self, tasks: list[TaskItem]) -> list[str]:
+        """Collect unique milestones in stable order."""
+
+        milestones: list[str] = []
+        for task in tasks:
+            if task.milestone not in milestones:
+                milestones.append(task.milestone)
+        return milestones
 
     def _extract_facts(
         self,
