@@ -10,8 +10,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import json
 import re
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
+from pydantic import ValidationError
+
+from prompts import (
+    build_facts_extraction_prompt,
+    build_next_question_prompt,
+    build_prd_drafting_prompt,
+)
 
 from schemas import (
     ExtractedFacts,
@@ -186,22 +196,6 @@ def _merge_list(existing: list[str], incoming: list[str]) -> list[str]:
     return _dedupe_items([*existing, *incoming])
 
 
-def _render_question_text(result: NextQuestionResult) -> str:
-    """中文说明：将结构化下一问渲染为响应字符串。
-
-    输入：结构化问题结果。
-    输出：适合直接返回给接口调用方的文本问题。
-    关键逻辑：保证最多只出现 1 个主问题和 1 个补充问题。
-    """
-
-    if result.secondary_question:
-        return (
-            f"主问题：{result.primary_question}\n"
-            f"补充问题：{result.secondary_question}"
-        )
-    return result.primary_question
-
-
 def _fallback_goal_from_input(input_text: str) -> Optional[str]:
     """中文说明：从一句话需求中兜底提取初始 goal 候选。
 
@@ -212,6 +206,26 @@ def _fallback_goal_from_input(input_text: str) -> Optional[str]:
 
     cleaned = input_text.strip()
     return cleaned or None
+
+
+class LLMProviderError(Exception):
+    """中文说明：LLM provider 相关异常的统一基类。"""
+
+
+class LLMProviderConfigurationError(LLMProviderError):
+    """中文说明：provider 缺少必要配置时抛出的异常。"""
+
+
+class LLMProviderUpstreamError(LLMProviderError):
+    """中文说明：上游兼容接口调用失败或响应不完整时抛出的异常。"""
+
+
+class LLMProviderJSONDecodeError(LLMProviderError):
+    """中文说明：LLM 返回内容无法提取或解析为 JSON 时抛出的异常。"""
+
+
+class LLMProviderSchemaValidationError(LLMProviderError):
+    """中文说明：LLM 返回 JSON 可解析但结构不符合预期 schema 时抛出的异常。"""
 
 
 class BaseLLMProvider(ABC):
@@ -710,7 +724,7 @@ class StubLLMProvider(BaseLLMProvider):
 
 
 class OpenAICompatibleLLMProvider(BaseLLMProvider):
-    """中文说明：兼容 OpenAI 风格接口的 provider 骨架。"""
+    """中文说明：兼容 OpenAI 风格接口的真实 provider 实现。"""
 
     def __init__(
         self,
@@ -719,16 +733,32 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         api_key: Optional[str] = None,
         model: Optional[str] = None,
     ) -> None:
-        """中文说明：初始化 OpenAI-compatible provider 骨架。
+        """中文说明：初始化 OpenAI-compatible provider。
 
         输入：可选的 base_url、api_key、model。
         输出：provider 实例。
-        关键逻辑：当前只固定依赖注入接口，不在此处绑定具体厂商实现。
+        关键逻辑：仅依赖 OpenAI-compatible chat completions 协议，不绑定具体厂商。
         """
 
-        self._base_url = base_url
-        self._api_key = api_key
-        self._model = model
+        missing_fields = [
+            field_name
+            for field_name, value in {
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+            }.items()
+            if not value
+        ]
+        if missing_fields:
+            raise LLMProviderConfigurationError(
+                "OpenAI-compatible provider 缺少必要配置: "
+                + ", ".join(missing_fields)
+            )
+
+        self._base_url = str(base_url).rstrip("/")
+        self._api_key = str(api_key)
+        self._model = str(model)
+        self._timeout = 30.0
 
     def extract_facts_from_turn(
         self,
@@ -737,14 +767,26 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         input_text: str,
         project_context: Optional[str],
     ) -> FactExtractionResult:
-        """中文说明：占位的事实抽取接口。
+        """中文说明：调用兼容接口完成 facts 抽取并返回结构化结果。
 
         输入：已有 facts、本轮输入、项目上下文。
         输出：结构化抽取结果。
-        关键逻辑：当前提供骨架，待后续接入真实兼容接口。
+        关键逻辑：优先请求 JSON 响应，必要时从普通文本中提取 JSON 对象。
         """
 
-        raise NotImplementedError("OpenAI-compatible fact extraction is not implemented yet.")
+        prompt = build_facts_extraction_prompt(
+            existing_facts=existing_facts,
+            input_text=input_text,
+            project_context=project_context,
+        )
+        json_text = self._request_json_text(
+            prompt,
+            json_instruction=(
+                "请只返回一个 JSON 对象，不要输出 Markdown 代码块或额外说明。"
+            ),
+            temperature=0.1,
+        )
+        return self._validate_fact_extraction_result(json_text)
 
     def generate_next_question(
         self,
@@ -753,14 +795,26 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         open_questions: list[OpenQuestion],
         project_context: Optional[str],
     ) -> NextQuestionResult:
-        """中文说明：占位的下一轮追问接口。
+        """中文说明：调用兼容接口生成结构化下一问。
 
         输入：facts、open questions、项目上下文。
         输出：结构化下一问。
-        关键逻辑：当前提供骨架，待后续接入真实兼容接口。
+        关键逻辑：优先请求 JSON 响应，必要时回退为文本提取 JSON。
         """
 
-        raise NotImplementedError("OpenAI-compatible next-question generation is not implemented yet.")
+        prompt = build_next_question_prompt(
+            facts=facts,
+            open_questions=open_questions,
+            project_context=project_context,
+        )
+        json_text = self._request_json_text(
+            prompt,
+            json_instruction=(
+                "请只返回一个 JSON 对象，字段必须包含 primary_question、secondary_question、question_count。"
+            ),
+            temperature=0.2,
+        )
+        return self._validate_next_question_result(json_text)
 
     def draft_prd_from_facts(
         self,
@@ -769,29 +823,217 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         project_context: Optional[str],
         quality: PrdQuality,
     ) -> str:
-        """中文说明：占位的 PRD 生成接口。
+        """中文说明：调用兼容接口生成 PRD markdown 文本。
 
         输入：facts、项目上下文、质量档位。
         输出：PRD markdown。
-        关键逻辑：当前提供骨架，待后续接入真实兼容接口。
+        关键逻辑：PRD 生成不要求 JSON，直接返回文本 markdown。
         """
 
-        raise NotImplementedError("OpenAI-compatible PRD drafting is not implemented yet.")
+        prompt = build_prd_drafting_prompt(
+            facts=facts,
+            project_context=project_context,
+            quality=quality,
+        )
+        return self._request_text_completion(prompt, temperature=0.3).strip()
 
     def generate(self, prompt: str) -> str:
-        """中文说明：占位的兼容旧接口生成方法。
+        """中文说明：兼容旧接口的文本生成方法。
 
         输入：旧版 prompt 文本。
         输出：生成结果。
-        关键逻辑：当前提供骨架，避免接口缺失。
+        关键逻辑：统一复用文本 completion 能力，不额外区分业务模式。
         """
 
-        raise NotImplementedError("OpenAI-compatible generate(prompt) is not implemented yet.")
+        return self._request_text_completion(prompt, temperature=0.3).strip()
+
+    def _build_chat_messages(self, prompt: str) -> list[dict[str, str]]:
+        """中文说明：将单字符串 prompt 封装为兼容 chat completions 的消息数组。"""
+
+        return [{"role": "user", "content": prompt}]
+
+    def _create_chat_completion(
+        self,
+        *,
+        prompt: str,
+        temperature: float,
+        response_format: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """中文说明：调用 OpenAI-compatible `/chat/completions` 并返回原始 JSON 响应。"""
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": self._build_chat_messages(prompt),
+            "temperature": temperature,
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.post(
+                    f"{self._base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPError as exc:
+            raise LLMProviderUpstreamError(
+                f"OpenAI-compatible provider 调用失败: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise LLMProviderUpstreamError(
+                "OpenAI-compatible provider 返回了无法解析的响应体。"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise LLMProviderUpstreamError("OpenAI-compatible provider 响应不是 JSON 对象。")
+        return data
+
+    def _extract_message_text(self, response_data: dict[str, Any]) -> str:
+        """中文说明：从 chat completions 响应中提取首个候选文本内容。"""
+
+        try:
+            choices = response_data["choices"]
+            first_choice = choices[0]
+            message = first_choice["message"]
+            content = message["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMProviderUpstreamError(
+                "OpenAI-compatible provider 响应缺少 choices/message/content。"
+            ) from exc
+
+        if isinstance(content, str):
+            text = content.strip()
+            if text:
+                return text
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(
+                    item.get("text"), str
+                ):
+                    text_parts.append(item["text"])
+            text = "".join(text_parts).strip()
+            if text:
+                return text
+        raise LLMProviderUpstreamError("OpenAI-compatible provider 未返回可用文本内容。")
+
+    def _request_text_completion(self, prompt: str, *, temperature: float) -> str:
+        """中文说明：请求普通文本 completion 并返回抽取后的文本内容。"""
+
+        response_data = self._create_chat_completion(
+            prompt=prompt,
+            temperature=temperature,
+        )
+        return self._extract_message_text(response_data)
+
+    def _request_json_text(
+        self,
+        prompt: str,
+        *,
+        json_instruction: str,
+        temperature: float,
+    ) -> str:
+        """中文说明：优先请求 JSON 输出，必要时回退到文本并显式提取 JSON 对象。"""
+
+        prompt_with_instruction = f"{prompt}\n{json_instruction}"
+        try:
+            response_data = self._create_chat_completion(
+                prompt=prompt_with_instruction,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+            response_text = self._extract_message_text(response_data)
+            json_object_text = self._extract_json_object_from_text(response_text)
+            self._parse_json_object(json_object_text)
+            return json_object_text
+        except (LLMProviderUpstreamError, LLMProviderJSONDecodeError):
+            fallback_text = self._request_text_completion(
+                prompt_with_instruction,
+                temperature=temperature,
+            )
+            return self._extract_json_object_from_text(fallback_text)
+
+    def _extract_json_object_from_text(self, text: str) -> str:
+        """中文说明：从文本中提取首个层级完整的 JSON 对象字符串。"""
+
+        start_index = text.find("{")
+        if start_index == -1:
+            raise LLMProviderJSONDecodeError("LLM 返回文本中未找到 JSON 对象起始符。")
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start_index, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start_index : index + 1]
+        raise LLMProviderJSONDecodeError("LLM 返回文本中的 JSON 对象不完整。")
+
+    def _parse_json_object(self, text: str) -> dict[str, Any]:
+        """中文说明：将 JSON 文本解析为对象，并确保顶层是 dict。"""
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise LLMProviderJSONDecodeError(
+                f"LLM 返回内容不是合法 JSON: {exc.msg}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise LLMProviderJSONDecodeError("LLM 返回的 JSON 顶层不是对象。")
+        return data
+
+    def _validate_fact_extraction_result(self, text: str) -> FactExtractionResult:
+        """中文说明：将 JSON 文本校验并转换为 `FactExtractionResult`。"""
+
+        data = self._parse_json_object(text)
+        try:
+            return FactExtractionResult.model_validate(data)
+        except ValidationError as exc:
+            raise LLMProviderSchemaValidationError(
+                "LLM facts 抽取 JSON 结构不符合 `FactExtractionResult`。"
+            ) from exc
+
+    def _validate_next_question_result(self, text: str) -> NextQuestionResult:
+        """中文说明：将 JSON 文本校验并转换为 `NextQuestionResult`。"""
+
+        data = self._parse_json_object(text)
+        try:
+            return NextQuestionResult.model_validate(data)
+        except ValidationError as exc:
+            raise LLMProviderSchemaValidationError(
+                "LLM 下一问 JSON 结构不符合 `NextQuestionResult`。"
+            ) from exc
 
 
 __all__ = [
     "BaseLLMProvider",
+    "LLMProviderConfigurationError",
+    "LLMProviderError",
+    "LLMProviderJSONDecodeError",
+    "LLMProviderSchemaValidationError",
+    "LLMProviderUpstreamError",
     "OpenAICompatibleLLMProvider",
     "StubLLMProvider",
-    "_render_question_text",
 ]

@@ -8,11 +8,20 @@
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from llm import StubLLMProvider
+from llm import (
+    BaseLLMProvider,
+    LLMProviderJSONDecodeError,
+    LLMProviderSchemaValidationError,
+    LLMProviderUpstreamError,
+    OpenAICompatibleLLMProvider,
+    StubLLMProvider,
+)
 from schemas import (
     ErrorResponse,
     GeneratePrdRequest,
@@ -37,8 +46,39 @@ from session_store import InMemorySessionStore
 
 app = FastAPI(title="prd_skill")
 
+
+def build_llm_provider_from_env() -> BaseLLMProvider:
+    """中文说明：根据环境变量构造当前服务使用的 LLM provider。"""
+
+    provider_name = os.getenv("PRD_SKILL_LLM_PROVIDER", "stub").strip().lower()
+    if provider_name == "stub":
+        return StubLLMProvider()
+    if provider_name == "openai_compatible":
+        env_mapping = {
+            "PRD_SKILL_LLM_BASE_URL": os.getenv("PRD_SKILL_LLM_BASE_URL"),
+            "PRD_SKILL_LLM_API_KEY": os.getenv("PRD_SKILL_LLM_API_KEY"),
+            "PRD_SKILL_LLM_MODEL": os.getenv("PRD_SKILL_LLM_MODEL"),
+        }
+        missing_env_vars = [
+            env_name for env_name, value in env_mapping.items() if not value
+        ]
+        if missing_env_vars:
+            raise ValueError(
+                "OpenAI-compatible provider 缺少必要环境变量: "
+                + ", ".join(missing_env_vars)
+            )
+        return OpenAICompatibleLLMProvider(
+            base_url=env_mapping["PRD_SKILL_LLM_BASE_URL"],
+            api_key=env_mapping["PRD_SKILL_LLM_API_KEY"],
+            model=env_mapping["PRD_SKILL_LLM_MODEL"],
+        )
+    raise ValueError(
+        "Unsupported PRD_SKILL_LLM_PROVIDER: "
+        f"{provider_name}. Expected 'stub' or 'openai_compatible'."
+    )
+
 _session_store = InMemorySessionStore()
-_llm_provider = StubLLMProvider()
+_llm_provider = build_llm_provider_from_env()
 _service = PrdService(_session_store, _llm_provider)
 
 
@@ -142,10 +182,58 @@ async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResp
     )
 
 
+@app.exception_handler(LLMProviderUpstreamError)
+async def handle_llm_upstream_error(
+    _request: Request, exc: LLMProviderUpstreamError
+) -> JSONResponse:
+    """中文说明：将上游 LLM 调用失败映射为统一错误响应。"""
+
+    return _error_response(
+        502,
+        ErrorResponse(
+            error_code="LLM_UPSTREAM_ERROR",
+            message=str(exc),
+            details={},
+        ),
+    )
+
+
+@app.exception_handler(LLMProviderJSONDecodeError)
+async def handle_llm_json_decode_error(
+    _request: Request, exc: LLMProviderJSONDecodeError
+) -> JSONResponse:
+    """中文说明：将 LLM 非法 JSON 响应映射为统一错误响应。"""
+
+    return _error_response(
+        502,
+        ErrorResponse(
+            error_code="LLM_JSON_DECODE_ERROR",
+            message=str(exc),
+            details={},
+        ),
+    )
+
+
+@app.exception_handler(LLMProviderSchemaValidationError)
+async def handle_llm_schema_validation_error(
+    _request: Request, exc: LLMProviderSchemaValidationError
+) -> JSONResponse:
+    """中文说明：将 LLM JSON 结构错误映射为统一错误响应。"""
+
+    return _error_response(
+        502,
+        ErrorResponse(
+            error_code="LLM_SCHEMA_VALIDATION_ERROR",
+            message=str(exc),
+            details={},
+        ),
+    )
+
+
 @app.get(
     "/health",
     response_model=HealthResponse,
-    responses={500: {"model": ErrorResponse}},
+    responses={500: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
 )
 async def health() -> HealthResponse:
     """中文说明：返回服务健康状态。"""
@@ -160,6 +248,7 @@ async def health() -> HealthResponse:
         400: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
     },
 )
 async def start_session(request: SessionStartRequest) -> SessionStartResponse:
@@ -176,6 +265,7 @@ async def start_session(request: SessionStartRequest) -> SessionStartResponse:
         404: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
     },
 )
 async def continue_session(request: SessionContinueRequest) -> SessionContinueResponse:
@@ -192,6 +282,7 @@ async def continue_session(request: SessionContinueRequest) -> SessionContinueRe
         404: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
     },
 )
 async def generate_prd(request: GeneratePrdRequest) -> PrdGenerateResponse:
@@ -207,6 +298,7 @@ async def generate_prd(request: GeneratePrdRequest) -> PrdGenerateResponse:
         400: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
     },
 )
 async def generate_tasks(request: TasksGenerateRequest) -> TasksGenerateResponse:
