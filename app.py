@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-import os
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -22,6 +20,7 @@ from llm import (
     OpenAICompatibleLLMProvider,
     StubLLMProvider,
 )
+from settings import LLMProviderSettings, load_llm_provider_settings_from_env
 from schemas import (
     ErrorResponse,
     GeneratePrdRequest,
@@ -47,35 +46,21 @@ from session_store import InMemorySessionStore
 app = FastAPI(title="prd_skill")
 
 
-def build_llm_provider_from_env() -> BaseLLMProvider:
-    """中文说明：根据环境变量构造当前服务使用的 LLM provider。"""
+def build_llm_provider_from_settings(settings: LLMProviderSettings) -> BaseLLMProvider:
+    """中文说明：根据配置对象装配当前服务使用的 LLM provider。"""
 
-    provider_name = os.getenv("PRD_SKILL_LLM_PROVIDER", "stub").strip().lower()
-    if provider_name == "stub":
+    if settings.provider == "stub":
         return StubLLMProvider()
-    if provider_name == "openai_compatible":
-        env_mapping = {
-            "PRD_SKILL_LLM_BASE_URL": os.getenv("PRD_SKILL_LLM_BASE_URL"),
-            "PRD_SKILL_LLM_API_KEY": os.getenv("PRD_SKILL_LLM_API_KEY"),
-            "PRD_SKILL_LLM_MODEL": os.getenv("PRD_SKILL_LLM_MODEL"),
-        }
-        missing_env_vars = [
-            env_name for env_name, value in env_mapping.items() if not value
-        ]
-        if missing_env_vars:
-            raise ValueError(
-                "OpenAI-compatible provider 缺少必要环境变量: "
-                + ", ".join(missing_env_vars)
-            )
-        return OpenAICompatibleLLMProvider(
-            base_url=env_mapping["PRD_SKILL_LLM_BASE_URL"],
-            api_key=env_mapping["PRD_SKILL_LLM_API_KEY"],
-            model=env_mapping["PRD_SKILL_LLM_MODEL"],
-        )
-    raise ValueError(
-        "Unsupported PRD_SKILL_LLM_PROVIDER: "
-        f"{provider_name}. Expected 'stub' or 'openai_compatible'."
-    )
+    if settings.provider == "openai_compatible":
+        return OpenAICompatibleLLMProvider(settings=settings)
+    raise ValueError(f"Unsupported PRD_SKILL_LLM_PROVIDER: {settings.provider}")
+
+
+def build_llm_provider_from_env() -> BaseLLMProvider:
+    """中文说明：从环境变量加载配置并装配当前服务使用的 LLM provider。"""
+
+    settings = load_llm_provider_settings_from_env()
+    return build_llm_provider_from_settings(settings)
 
 _session_store = InMemorySessionStore()
 _llm_provider = build_llm_provider_from_env()

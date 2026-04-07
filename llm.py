@@ -22,6 +22,7 @@ from prompts import (
     build_next_question_prompt,
     build_prd_drafting_prompt,
 )
+from settings import LLMProviderSettings
 
 from schemas import (
     ExtractedFacts,
@@ -729,36 +730,24 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
     def __init__(
         self,
         *,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
+        settings: LLMProviderSettings,
     ) -> None:
         """中文说明：初始化 OpenAI-compatible provider。
 
-        输入：可选的 base_url、api_key、model。
+        输入：已完成校验的 provider 配置对象。
         输出：provider 实例。
         关键逻辑：仅依赖 OpenAI-compatible chat completions 协议，不绑定具体厂商。
         """
 
-        missing_fields = [
-            field_name
-            for field_name, value in {
-                "base_url": base_url,
-                "api_key": api_key,
-                "model": model,
-            }.items()
-            if not value
-        ]
-        if missing_fields:
+        if (
+            settings.base_url is None
+            or settings.api_key is None
+            or settings.model is None
+        ):
             raise LLMProviderConfigurationError(
-                "OpenAI-compatible provider 缺少必要配置: "
-                + ", ".join(missing_fields)
+                "OpenAI-compatible provider 缺少必要配置，请检查 settings。"
             )
-
-        self._base_url = str(base_url).rstrip("/")
-        self._api_key = str(api_key)
-        self._model = str(model)
-        self._timeout = 30.0
+        self._settings = settings
 
     def extract_facts_from_turn(
         self,
@@ -784,7 +773,7 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
             json_instruction=(
                 "请只返回一个 JSON 对象，不要输出 Markdown 代码块或额外说明。"
             ),
-            temperature=0.1,
+            temperature=self._settings.temperature_json,
         )
         return self._validate_fact_extraction_result(json_text)
 
@@ -812,7 +801,7 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
             json_instruction=(
                 "请只返回一个 JSON 对象，字段必须包含 primary_question、secondary_question、question_count。"
             ),
-            temperature=0.2,
+            temperature=self._settings.temperature_json,
         )
         return self._validate_next_question_result(json_text)
 
@@ -835,7 +824,10 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
             project_context=project_context,
             quality=quality,
         )
-        return self._request_text_completion(prompt, temperature=0.3).strip()
+        return self._request_text_completion(
+            prompt,
+            temperature=self._settings.temperature_text,
+        ).strip()
 
     def generate(self, prompt: str) -> str:
         """中文说明：兼容旧接口的文本生成方法。
@@ -845,39 +837,72 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         关键逻辑：统一复用文本 completion 能力，不额外区分业务模式。
         """
 
-        return self._request_text_completion(prompt, temperature=0.3).strip()
+        return self._request_text_completion(
+            prompt,
+            temperature=self._settings.temperature_text,
+        ).strip()
 
     def _build_chat_messages(self, prompt: str) -> list[dict[str, str]]:
         """中文说明：将单字符串 prompt 封装为兼容 chat completions 的消息数组。"""
 
         return [{"role": "user", "content": prompt}]
 
-    def _create_chat_completion(
+    def _build_request_url(self) -> str:
+        """中文说明：根据当前 API 风格构造 chat completions 请求 URL。"""
+
+        if self._settings.api_style != "openai_compatible":
+            raise LLMProviderConfigurationError(
+                "当前 provider 仅支持 openai_compatible API 风格。"
+            )
+        return f"{self._settings.base_url.rstrip('/')}/chat/completions"
+
+    def _build_headers(self) -> dict[str, str]:
+        """中文说明：构造 OpenAI-compatible 请求头。"""
+
+        return {
+            "Authorization": f"Bearer {self._settings.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _build_response_format(
+        self,
+        *,
+        enable_json_output: bool,
+    ) -> Optional[dict[str, str]]:
+        """中文说明：根据配置与调用意图决定是否附带 response_format。"""
+
+        if not enable_json_output:
+            return None
+        if not self._settings.response_format_enabled:
+            return None
+        return {"type": "json_object"}
+
+    def _build_payload(
         self,
         *,
         prompt: str,
         temperature: float,
-        response_format: Optional[dict[str, str]] = None,
+        response_format: Optional[dict[str, str]],
     ) -> dict[str, Any]:
-        """中文说明：调用 OpenAI-compatible `/chat/completions` 并返回原始 JSON 响应。"""
+        """中文说明：构造 OpenAI-compatible chat completions 请求体。"""
 
         payload: dict[str, Any] = {
-            "model": self._model,
+            "model": self._settings.model,
             "messages": self._build_chat_messages(prompt),
             "temperature": temperature,
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        return payload
 
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+    def _send_chat_completion_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """中文说明：发送 HTTP 请求并返回解析后的原始 JSON 响应。"""
+
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._settings.timeout_seconds) as client:
                 response = client.post(
-                    f"{self._base_url}/chat/completions",
-                    headers=headers,
+                    self._build_request_url(),
+                    headers=self._build_headers(),
                     json=payload,
                 )
                 response.raise_for_status()
@@ -894,6 +919,24 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         if not isinstance(data, dict):
             raise LLMProviderUpstreamError("OpenAI-compatible provider 响应不是 JSON 对象。")
         return data
+
+    def _create_chat_completion(
+        self,
+        *,
+        prompt: str,
+        temperature: float,
+        enable_json_output: bool,
+    ) -> dict[str, Any]:
+        """中文说明：调用 OpenAI-compatible `/chat/completions` 并返回原始 JSON 响应。"""
+
+        payload = self._build_payload(
+            prompt=prompt,
+            temperature=temperature,
+            response_format=self._build_response_format(
+                enable_json_output=enable_json_output,
+            ),
+        )
+        return self._send_chat_completion_request(payload)
 
     def _extract_message_text(self, response_data: dict[str, Any]) -> str:
         """中文说明：从 chat completions 响应中提取首个候选文本内容。"""
@@ -930,6 +973,22 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         response_data = self._create_chat_completion(
             prompt=prompt,
             temperature=temperature,
+            enable_json_output=False,
+        )
+        return self._extract_message_text(response_data)
+
+    def _request_response_format_text(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+    ) -> str:
+        """中文说明：请求带 response_format 的 completion 并返回文本内容。"""
+
+        response_data = self._create_chat_completion(
+            prompt=prompt,
+            temperature=temperature,
+            enable_json_output=True,
         )
         return self._extract_message_text(response_data)
 
@@ -943,22 +1002,22 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         """中文说明：优先请求 JSON 输出，必要时回退到文本并显式提取 JSON 对象。"""
 
         prompt_with_instruction = f"{prompt}\n{json_instruction}"
-        try:
-            response_data = self._create_chat_completion(
-                prompt=prompt_with_instruction,
-                temperature=temperature,
-                response_format={"type": "json_object"},
-            )
-            response_text = self._extract_message_text(response_data)
-            json_object_text = self._extract_json_object_from_text(response_text)
-            self._parse_json_object(json_object_text)
-            return json_object_text
-        except (LLMProviderUpstreamError, LLMProviderJSONDecodeError):
-            fallback_text = self._request_text_completion(
-                prompt_with_instruction,
-                temperature=temperature,
-            )
-            return self._extract_json_object_from_text(fallback_text)
+        if self._settings.response_format_enabled:
+            try:
+                response_text = self._request_response_format_text(
+                    prompt_with_instruction,
+                    temperature=temperature,
+                )
+                json_object_text = self._extract_json_object_from_text(response_text)
+                self._parse_json_object(json_object_text)
+                return json_object_text
+            except (LLMProviderUpstreamError, LLMProviderJSONDecodeError):
+                pass
+        fallback_text = self._request_text_completion(
+            prompt_with_instruction,
+            temperature=temperature,
+        )
+        return self._extract_json_object_from_text(fallback_text)
 
     def _extract_json_object_from_text(self, text: str) -> str:
         """中文说明：从文本中提取首个层级完整的 JSON 对象字符串。"""
@@ -1008,12 +1067,27 @@ class OpenAICompatibleLLMProvider(BaseLLMProvider):
         """中文说明：将 JSON 文本校验并转换为 `FactExtractionResult`。"""
 
         data = self._parse_json_object(text)
+        if "merged_facts" in data:
+            try:
+                return FactExtractionResult.model_validate(data)
+            except ValidationError as exc:
+                raise LLMProviderSchemaValidationError(
+                    "LLM facts 抽取 JSON 结构不符合 `FactExtractionResult`。"
+                ) from exc
+
         try:
-            return FactExtractionResult.model_validate(data)
+            extracted_facts = ExtractedFacts.model_validate(data)
         except ValidationError as exc:
             raise LLMProviderSchemaValidationError(
                 "LLM facts 抽取 JSON 结构不符合 `FactExtractionResult`。"
             ) from exc
+        return FactExtractionResult(
+            merged_facts=extracted_facts,
+            open_questions=[],
+            newly_confirmed_fields=[],
+            conflicts=[],
+            reasoning_summary="",
+        )
 
     def _validate_next_question_result(self, text: str) -> NextQuestionResult:
         """中文说明：将 JSON 文本校验并转换为 `NextQuestionResult`。"""
